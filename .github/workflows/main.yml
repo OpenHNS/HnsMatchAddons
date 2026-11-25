@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      COMMIT_SHA: ${{ steps.declare_sha.outputs.COMMIT_SHA }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Declare SHA
+        id: declare_sha
+        shell: bash
+        run: echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup latest ReAPI includes
+        env:
+          REPO: rehlds/reapi
+        run: |
+          mkdir -p dep/reapi
+          cd dep/reapi
+
+          curl \
+            --silent \
+            "https://api.github.com/repos/$REPO/releases/latest" | \
+            grep "browser_download_url" | \
+            grep -Eo 'https://[^\"]*' | \
+            xargs wget
+
+          7z x '*.zip'
+
+          echo "REAPI_INCLUDE_PATH=$(pwd)/addons/amxmodx/scripting/include" >> "$GITHUB_ENV"
+
+      - name: Setup AMXXPawn compiler
+        env:
+          AMXX_ARCHIVE: amxmodx-1.9.0-git5303-base-linux.tar.gz
+          AMXX_SHA256: 1ed6898ced2c1fcf225c288b94effc19917e987b284e42911587738ee3c93699
+          AMXX_VERSION: 1.9.0.5303
+        run: |
+          mkdir -p dep/amxx
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            --output "dep/$AMXX_ARCHIVE" \
+            "https://github.com/alliedmodders/amxmodx/releases/download/$AMXX_VERSION/$AMXX_ARCHIVE"
+
+          echo "$AMXX_SHA256  dep/$AMXX_ARCHIVE" | sha256sum --check -
+          tar -xzf "dep/$AMXX_ARCHIVE" -C dep/amxx
+
+          AMXX_COMPILER_PATH="$(pwd)/dep/amxx/addons/amxmodx/scripting"
+          test -x "$AMXX_COMPILER_PATH/amxxpc"
+          echo "$AMXX_COMPILER_PATH" >> "$GITHUB_PATH"
+          echo "AMXX_INCLUDE_PATH=$AMXX_COMPILER_PATH/include" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$AMXX_COMPILER_PATH" >> "$GITHUB_ENV"
+
+      - name: Compile plugins
+        env:
+          AMXX_INCLUDE: ${{ env.AMXX_INCLUDE_PATH }}
+          REAPI_INCLUDE: ${{ env.REAPI_INCLUDE_PATH }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p build/addons/amxmodx/plugins
+          mkdir -p build/addons/amxmodx/scripting/include
+
+          cp ./*.sma build/addons/amxmodx/scripting/
+          cp ./include/*.inc build/addons/amxmodx/scripting/include/
+          cp ./README*.md build/
+
+          while IFS= read -r -d '' sourcefile; do
+            filename="$(basename "$sourcefile")"
+            amxxfile="${filename%.sma}.amxx"
+
+            echo "Compiling $filename ..."
+            amxxpc "$sourcefile" \
+              -o"build/addons/amxmodx/plugins/$amxxfile" \
+              -i"include" \
+              -i"$AMXX_INCLUDE" \
+              -i"$REAPI_INCLUDE"
+          done < <(find . -maxdepth 1 -type f -name '*.sma' -print0)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: HnsMatchAddons-${{ steps.declare_sha.outputs.COMMIT_SHA }}-dev
+          path: build/
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-24.04
+    needs: [build]
+    if: |
+      github.event_name == 'release' &&
+      github.event.action == 'published' &&
+      startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: HnsMatchAddons-${{ needs.build.outputs.COMMIT_SHA }}-dev
+          path: package
+
+      - name: Package binaries
+        run: |
+          cd package
+          7z a -mm=Deflate -mfb=258 -mpass=15 -r \
+            "../HnsMatchAddons-${{ github.event.release.tag_name }}.zip" ./
+
+      - name: Publish artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          files: HnsMatchAddons-${{ github.event.release.tag_name }}.zip
